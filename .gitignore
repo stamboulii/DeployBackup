@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Project specific
+logs/
+data/
+mock_ftp_root/
+deploy_state.json
+state.json
+.DS_Store

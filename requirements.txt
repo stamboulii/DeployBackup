@@ -1,0 +1,3 @@
+PyYAML>=6.0.1
+pyftpdlib>=1.5.10
+python-dotenv>=1.0.0
