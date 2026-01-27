@@ -57,32 +57,73 @@ class SynergyTool:
                 }
         return files
 
-    def get_remote_files(self, ftp, remote_root):
-        files = {}
-        try:
-            ftp.cwd(remote_root)
-            items = []
-            ftp.retrlines('MLSD', items.append)
-            
-            for item in items:
-                parts = item.split(';')
-                name = parts[-1].strip()
-                props = {p.split('=')[0]: p.split('=')[1] for p in parts[:-1] if '=' in p}
-                full_path = os.path.join(remote_root, name).replace('\\', '/')
-                
-                if props.get('type') == 'dir':
-                    if name in ('.', '..'): continue
-                    files.update(self.get_remote_files(ftp, full_path))
-                elif props.get('type') == 'file':
-                    files[full_path] = {
-                        'size': int(props.get('size', 0)),
-                        'modify': props.get('modify', ''),
-                    }
-        except Exception as e:
-            logging.debug(f"Scan info: {e}")
-        return files
+    def get_remote_files(self, ftp, remote_root, base_path=''):
 
+        files = {}
+        current_path = os.path.join(remote_root, base_path).replace('\\', '/')
+        
+        try:
+            ftp.cwd(current_path)
+            items = []
+            
+            # Try MLSD first (more reliable)
+            try:
+                ftp.retrlines('MLSD', items.append)
+                
+                for item in items:
+                    parts = item.split(';')
+                    name = parts[-1].strip()
+                    
+                    if name in ('.', '..'):
+                        continue
+                    
+                    props = {p.split('=')[0]: p.split('=')[1] for p in parts[:-1] if '=' in p}
+                    rel_path = os.path.join(base_path, name).replace('\\', '/')
+                    
+                    if props.get('type') == 'dir':
+                        # Recursively scan subdirectory
+                        files.update(self.get_remote_files(ftp, remote_root, rel_path))
+                    elif props.get('type') == 'file':
+                        files[rel_path] = {
+                            'size': int(props.get('size', 0)),
+                            'modify': props.get('modify', ''),
+                        }
+            except:
+                # Fallback to LIST/DIR if MLSD not supported
+                items = []
+                ftp.dir(items.append)
+                
+                for item in items:
+                    parts = item.split(None, 8)
+                    if len(parts) < 9:
+                        continue
+                    
+                    permissions = parts[0]
+                    name = parts[8]
+                    
+                    if name in ('.', '..'):
+                        continue
+                    
+                    rel_path = os.path.join(base_path, name).replace('\\', '/')
+                    
+                    if permissions.startswith('d'):
+                        # Directory - recurse
+                        files.update(self.get_remote_files(ftp, remote_root, rel_path))
+                    else:
+                        # File
+                        files[rel_path] = {
+                            'size': int(parts[4]),
+                            'modify': '',  # Not available in LIST
+                        }
+                        
+        except Exception as e:
+            logging.error(f"Error scanning {current_path}: {e}")
+        
+        return files
     def ensure_remote_dir(self, ftp, remote_dir):
+        if not remote_dir or remote_dir == '/':
+            return
+            
         parts = remote_dir.strip('/').split('/')
         current = ''
         for part in parts:
@@ -90,9 +131,13 @@ class SynergyTool:
             current += '/' + part
             try:
                 ftp.cwd(current)
-            except:
-                logging.info(f"Creating remote directory: {current}")
-                ftp.mkd(current)
+            except Exception:
+                try:
+                    logging.info(f"Attempting to create directory: {current}")
+                    ftp.mkd(current)
+                    ftp.cwd(current)
+                except Exception as e:
+                    logging.warning(f"Could not create or enter {current}: {e}. This might be due to permissions.")
 
     def deploy(self, local_path, remote_project_name):
         remote_path = os.path.join(self.remote_base, remote_project_name).replace('\\', '/')
@@ -112,15 +157,20 @@ class SynergyTool:
                 
                 if needs_upload:
                     self.ensure_remote_dir(ftp, os.path.dirname(target_remote))
-                    with open(os.path.join(local_path, rel_path), 'rb') as f:
-                        ftp.storbinary(f"STOR {target_remote}", f)
-                    logging.info(f"Uploaded: {rel_path}")
+                    try:
+                        with open(os.path.join(local_path, rel_path), 'rb') as f:
+                            ftp.storbinary(f"STOR {target_remote}", f)
+                        logging.info(f"Uploaded: {rel_path}")
+                    except Exception as e:
+                        logging.error(f"Failed to upload {rel_path}: {e}")
+                        logging.error("👉 Hint: Check your FTP_REMOTE_ROOT in .env. Does this folder exist and do you have write permissions?")
+                        logging.error(f"   Target path was: {target_remote}")
                 
                 new_state[rel_path] = info
         self.save_state(state_file, new_state)
         logging.info("Deployment finished.")
 
-    def backup(self, local_path, remote_project_name):
+    # def backup(self, local_path, remote_project_name):
         remote_path = os.path.join(self.remote_base, remote_project_name).replace('\\', '/')
         state_file = f"state_backup_{remote_project_name}.json"
         
@@ -131,9 +181,17 @@ class SynergyTool:
             os.makedirs(local_path)
 
         with self.connect() as ftp:
+            logging.info(f"Scanning remote project path: {remote_path}")
             remote_files = self.get_remote_files(ftp, remote_path)
+            
             if not remote_files:
                 logging.warning(f"No files found in remote project: {remote_path}")
+                logging.info("listing accessible folders at root for verification:")
+                try:
+                    ftp.cwd(self.remote_base)
+                    ftp.retrlines('LIST')
+                except Exception as e:
+                    logging.warning(f"Could not list root: {e}")
                 return
 
             for r_path, info in remote_files.items():
@@ -153,6 +211,56 @@ class SynergyTool:
                 new_state[r_path] = info
         self.save_state(state_file, new_state)
         logging.info("Backup finished.")
+    def backup(self, local_path, remote_project_name):
+        remote_path = os.path.join(self.remote_base, remote_project_name).replace('\\', '/')
+        state_file = f"state_backup_{remote_project_name.replace('/', '_')}.json"
+        
+        current_state = self.load_state(state_file)
+        new_state = {}
+
+        if not os.path.exists(local_path):
+            os.makedirs(local_path)
+
+        with self.connect() as ftp:
+            logging.info(f"Scanning remote project path: {remote_path}")
+            
+            # Get remote files with relative paths
+            remote_files = self.get_remote_files(ftp, remote_path)
+            
+            if not remote_files:
+                logging.warning(f"No files found in remote project: {remote_path}")
+                logging.info("Listing accessible folders at root for verification:")
+                try:
+                    ftp.cwd(self.remote_base if self.remote_base else '/')
+                    ftp.retrlines('LIST')
+                except Exception as e:
+                    logging.warning(f"Could not list root: {e}")
+                return
+
+            logging.info(f"Found {len(remote_files)} files to backup")
+            
+            for rel_path, info in remote_files.items():
+                # rel_path is already relative to remote_path
+                local_file_path = os.path.join(local_path, rel_path)
+                remote_file_path = os.path.join(remote_path, rel_path).replace('\\', '/')
+                
+                needs_download = rel_path not in current_state or \
+                                current_state[rel_path]['size'] != info['size'] or \
+                                current_state[rel_path]['modify'] != info['modify']
+                
+                if needs_download:
+                    os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                    try:
+                        with open(local_file_path, 'wb') as f:
+                            ftp.retrbinary(f"RETR {remote_file_path}", f.write)
+                        logging.info(f"Downloaded: {rel_path}")
+                    except Exception as e:
+                        logging.error(f"Failed to download {rel_path}: {e}")
+                
+                new_state[rel_path] = info
+                
+        self.save_state(state_file, new_state)
+        logging.info(f"Backup finished. {len(new_state)} files in state.")
 
     def load_state(self, path):
         if os.path.exists(path):
@@ -167,13 +275,22 @@ def interactive_menu():
     print("\n--- SYNERGY FTP TOOL ---")
     print("1. Deploy (Local -> FTP)")
     print("2. Backup (FTP -> Local)")
-    print("3. Setup .env template")
+    print("3. Setup .env file (Initial configuration)")
     print("4. Exit")
     
     choice = input("\nChoice: ")
     
     if choice == '3':
-        print("Template already exists at .env.example")
+        if not os.path.exists('.env'):
+            import shutil
+            if os.path.exists('.env.example'):
+                shutil.copy('.env.example', '.env')
+                print("\n✅ Success: .env file created from template.")
+                print("👉 Please open the '.env' file and fill in your FTP credentials.")
+            else:
+                print("\n❌ Error: .env.example not found.")
+        else:
+            print("\n💡 Info: .env file already exists. Open it to edit your credentials.")
         return
 
     if choice in ['1', '2']:
