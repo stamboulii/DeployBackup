@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 venv/
 .env
-
+.env.example
 # Project specific
 logs/
 data/
@@ -12,3 +12,4 @@ mock_ftp_root/
 deploy_state.json
 state.json
 .DS_Store
+state_*.json
