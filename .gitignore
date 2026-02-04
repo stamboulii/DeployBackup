@@ -9,7 +9,13 @@ venv/
 logs/
 data/
 mock_ftp_root/
+backup/
 deploy_state.json
 state.json
-.DS_Store
 state_*.json
+state_*.db
+.scan_cache_*.pkl
+.DS_Store
+nul
+test_paramiko.py
+test2.txt
