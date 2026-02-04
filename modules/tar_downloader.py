@@ -321,7 +321,7 @@ class TarStreamDownloader:
                 self._get_speed_stats()
             )
 
-        # Log stderr warnings
+        # Log stderr warnings and clean up SSH channel
         try:
             err = stderr.read().decode('utf-8', errors='replace').strip()
             if err:
@@ -331,6 +331,13 @@ class TarStreamDownloader:
                     logger.warning(f"tar: {line}")
         except Exception:
             pass
+
+        # Explicitly close streams to prevent "Socket is closed" noise on GC
+        for s in (stdin, stdout, stderr):
+            try:
+                s.close()
+            except Exception:
+                pass
 
     def _get_speed_stats(self) -> Dict:
         elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] else 1

@@ -191,10 +191,13 @@ class BackupOptimizedMixin:
         # PHASE 4: DOWNLOAD PARALLÈLE
         if not files_to_download:
             console.print("[bold green]✅ Local backup is up-to-date. Nothing to download.[/bold green]\n")
-            
-            # Sauvegarder le state quand même
-            state_manager.update_file_batch(remote_files)
-            
+
+            # Sauvegarder le state quand meme
+            console.print("[bold cyan]💾 Updating state database...[/bold cyan]")
+            with console.status("[bold cyan]Saving state..."):
+                state_manager.update_file_batch(remote_files, batch_size=5000)
+            console.print(f"[green]✅ State database updated[/green]\n")
+
             # Statistiques finales
             self._show_backup_summary(state_manager, sync_id, 0, 0, 0, datetime.now())
             return
