@@ -128,16 +128,26 @@ def interactive_menu():
             # Options avancées
             console.print("\n[bold yellow]💡 Configuration:[/bold yellow]")
             
-            # Déterminer le nombre de workers selon la taille
-            console.print("\n[dim]Connection speed:[/dim]")
-            console.print("  1. ADSL (< 10 Mbps) → 3-5 workers")
-            console.print("  2. Home Fiber (100 Mbps) → 10-15 workers [recommended]")
-            console.print("  3. Pro Fiber (1 Gbps) → 15-25 workers")
-            console.print("  4. Datacenter → 20-50 workers")
-            speed_choice = console.input("[bold]Your choice (1-4) [2]:[/bold] ") or "2"
-            
-            workers_map = {"1": 5, "2": 10, "3": 20, "4": 30}
-            workers = workers_map.get(speed_choice, 10)
+            # Déterminer le nombre de workers selon la connexion
+            is_sftp = tool.ftp_port == 22
+            if is_sftp:
+                console.print("\n[dim]SFTP detected — workers are capped at 5 (SSH connections are heavier)[/dim]")
+                console.print("[dim]Connection speed:[/dim]")
+                console.print("  1. Slow connection → 2 workers")
+                console.print("  2. Normal connection → 3 workers [recommended]")
+                console.print("  3. Fast connection → 5 workers")
+                speed_choice = console.input("[bold]Your choice (1-3) [2]:[/bold] ") or "2"
+                workers_map = {"1": 2, "2": 3, "3": 5}
+                workers = workers_map.get(speed_choice, 3)
+            else:
+                console.print("\n[dim]Connection speed:[/dim]")
+                console.print("  1. ADSL (< 10 Mbps) → 3-5 workers")
+                console.print("  2. Home Fiber (100 Mbps) → 10-15 workers [recommended]")
+                console.print("  3. Pro Fiber (1 Gbps) → 15-25 workers")
+                console.print("  4. Datacenter → 20-50 workers")
+                speed_choice = console.input("[bold]Your choice (1-4) [2]:[/bold] ") or "2"
+                workers_map = {"1": 5, "2": 10, "3": 20, "4": 30}
+                workers = workers_map.get(speed_choice, 10)
             
             exclude = console.input("\nExclude cache/logs/tmp files? (y/n) [y]: ") or "y"
             verify = console.input("Verify file integrity? (y/n) [y]: ") or "y"

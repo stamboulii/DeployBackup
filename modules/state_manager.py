@@ -122,6 +122,52 @@ class StateManager:
             cursor.execute('SELECT rel_path FROM file_state')
             return {row['rel_path'] for row in cursor.fetchall()}
     
+    def find_files_to_download(self, remote_files: Dict[str, Dict], batch_size: int = 5000):
+        """
+        Compare remote files against SQLite state without loading all state into memory.
+        Returns (files_to_download, deleted_files) where:
+          - files_to_download: list of (rel_path, size) tuples
+          - deleted_files: set of rel_paths that exist in DB but not in remote
+        """
+        files_to_download = []
+        total_bytes = 0
+        remote_paths = set(remote_files.keys())
+        remote_list = list(remote_files.items())
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check remote files against DB in batches
+            for i in range(0, len(remote_list), batch_size):
+                batch = remote_list[i:i + batch_size]
+                paths = [p for p, _ in batch]
+                placeholders = ','.join('?' * len(paths))
+
+                cursor.execute(
+                    f'SELECT rel_path, size, modify FROM file_state WHERE rel_path IN ({placeholders})',
+                    paths
+                )
+                existing = {row['rel_path']: row for row in cursor.fetchall()}
+
+                for rel_path, info in batch:
+                    row = existing.get(rel_path)
+                    if row is None or row['size'] != info['size'] or row['modify'] != info['modify']:
+                        files_to_download.append((rel_path, info['size']))
+                        total_bytes += info['size']
+
+            # Find deleted files: in DB but not in remote
+            cursor.execute('SELECT rel_path FROM file_state')
+            deleted_files = set()
+            while True:
+                rows = cursor.fetchmany(10000)
+                if not rows:
+                    break
+                for row in rows:
+                    if row['rel_path'] not in remote_paths:
+                        deleted_files.add(row['rel_path'])
+
+        return files_to_download, total_bytes, deleted_files
+
     def update_file_batch(self, files: Dict[str, Dict], batch_size: int = 1000):
         """
         Met à jour plusieurs fichiers en batch (beaucoup plus rapide)

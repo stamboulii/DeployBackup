@@ -7,6 +7,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
+from modules.sftp_adapter import SFTPAdapter
 
 # Load environment variables
 load_dotenv()
@@ -50,7 +51,11 @@ class SynergyCore:
             logging.error("Missing FTP credentials in .env file.")
             sys.exit(1)
         
-        ftp = FTP(timeout=300)
+        if self.ftp_port == 22:
+            ftp = SFTPAdapter(timeout=300)
+        else:
+            ftp = FTP(timeout=300)
+            
         ftp.connect(self.ftp_host, self.ftp_port)
         ftp.login(self.ftp_user, self.ftp_pass)
         return ftp

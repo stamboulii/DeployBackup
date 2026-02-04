@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c:*)",
+      "Bash(del \"c:\\\\DeployBackup\\\\.scan_cache_..pkl\")",
+      "Bash(python -m py_compile:*)",
+      "Bash(.venvScriptspip install -r requirements.txt)",
+      "Bash(powershell:*)",
+      "Bash(dir /s /b \"c:\\\\DeployBackup\\\\modules\\\\__pycache__\\\\*.pyc\")",
+      "Bash(if exist \"c:\\\\DeployBackup\\\\modules\\\\__pycache__\" rd /s /q \"c:\\\\DeployBackup\\\\modules\\\\__pycache__\")",
+      "Bash(if exist \"c:\\\\DeployBackup\\\\__pycache__\" rd /s /q \"c:\\\\DeployBackup\\\\__pycache__\")",
+      "Bash(cmd /c \"if exist c:\\\\DeployBackup\\\\modules\\\\__pycache__ rd /s /q c:\\\\DeployBackup\\\\modules\\\\__pycache__\")",
+      "Bash(cmd /c \"if exist c:\\\\DeployBackup\\\\__pycache__ rd /s /q c:\\\\DeployBackup\\\\__pycache__\")"
+    ]
+  }
+}

@@ -66,6 +66,12 @@ class BackupOptimizedMixin:
                 'use_incremental_scan': True,
                 'checkpoint_interval': 1000,  # Checkpoint tous les N fichiers
             }
+
+        # Cap workers for SFTP — SSH connections are heavier than FTP
+        if self.ftp_port == 22 and options['num_workers'] > 5:
+            console.print(f"[yellow]ℹ️  SFTP detected: reducing workers from {options['num_workers']} to 5 "
+                         f"(SSH connections are heavier than FTP)[/yellow]")
+            options['num_workers'] = 5
         
         remote_path = os.path.join(self.remote_base, remote_project_name).replace('\\', '/')
         
@@ -107,24 +113,38 @@ class BackupOptimizedMixin:
             if options.get('use_incremental_scan'):
                 # Scan incrémental (beaucoup plus rapide)
                 cache_file = f".scan_cache_{remote_project_name.replace('/', '_')}.pkl"
+
+                # Reconnect factory for scanner — creates a fresh connection
+                def scanner_reconnect():
+                    return self.connect()
+
                 scanner = IncrementalScanner(
-                    ftp, 
-                    remote_path, 
+                    ftp,
+                    remote_path,
                     cache_file=cache_file,
-                    incremental_threshold_hours=24
+                    incremental_threshold_hours=24,
+                    reconnect_factory=scanner_reconnect
                 )
                 
                 def scan_status_callback(stats):
-                    console.print(f"[dim]Scanned {stats['dirs_scanned']} dirs, "
-                                f"found {stats['files_found']} files "
-                                f"(cache hits: {stats['cache_hits']})[/dim]")
+                    if stats.get('strategy') == 'ssh_find':
+                        console.print(f"[dim]SSH find: found {stats['files_found']:,} files so far...[/dim]")
+                    else:
+                        console.print(f"[dim]Scanned {stats['dirs_scanned']} dirs, "
+                                    f"found {stats['files_found']} files "
+                                    f"(cache hits: {stats['cache_hits']})[/dim]")
                 
                 remote_files = scanner.scan_smart(status_callback=scan_status_callback)
                 scan_stats = scanner.get_statistics()
                 
                 console.print(f"[green]✅ Scan completed using [bold]{scan_stats['strategy']}[/bold] strategy[/green]")
                 console.print(f"[dim]   Dirs scanned: {scan_stats['dirs_scanned']}, "
-                            f"Files found: {scan_stats['files_found']}[/dim]\n")
+                            f"Files found: {scan_stats['files_found']}[/dim]")
+                if scan_stats.get('reconnections', 0) > 0:
+                    console.print(f"[yellow]   Reconnections during scan: {scan_stats['reconnections']}[/yellow]")
+                if scan_stats.get('scan_errors', 0) > 0:
+                    console.print(f"[yellow]   Directories skipped (errors): {scan_stats['scan_errors']}[/yellow]")
+                console.print()
             else:
                 # Scan complet classique
                 with console.status("[bold cyan]Scanning (full mode)...") as status:
@@ -148,53 +168,25 @@ class BackupOptimizedMixin:
         
         console.print(f"[bold green]✅ Found {len(remote_files):,} files to process[/bold green]\n")
         
-        # PHASE 2: COMPARISON avec state database
+        # PHASE 2 & 3: COMPARISON + DELETIONS (memory-efficient via SQLite)
         console.print("[bold cyan]🔍 PHASE 2: Comparing with local state...[/bold cyan]")
-        
-        with console.status("[bold cyan]Loading state database..."):
-            current_state_dict = state_manager.get_all_files()
-            current_state_set = state_manager.get_files_set()
-        
-        console.print(f"[dim]   State database loaded: {len(current_state_dict):,} files cached[/dim]")
-        
-        # Calculer les différences
-        files_to_download = []
-        total_bytes = 0
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("[cyan]Comparing files...", total=len(remote_files))
-            
-            for rel_path, info in remote_files.items():
-                needs_download = (
-                    rel_path not in current_state_dict or
-                    current_state_dict[rel_path]['size'] != info['size'] or
-                    current_state_dict[rel_path]['modify'] != info['modify']
-                )
-                
-                if needs_download:
-                    files_to_download.append((rel_path, info['size']))
-                    total_bytes += info['size']
-                
-                progress.update(task, advance=1)
-        
-        console.print(f"[green]✅ Comparison completed[/green]\n")
-        
+
+        with console.status("[bold cyan]Comparing against database..."):
+            files_to_download, total_bytes, deleted_files = state_manager.find_files_to_download(remote_files)
+
+        db_stats = state_manager.get_statistics()
+        console.print(f"[dim]   State database: {db_stats['total_files']:,} files cached[/dim]")
+        console.print(f"[green]✅ Comparison completed: {len(files_to_download):,} to download, "
+                      f"{len(deleted_files):,} deleted on remote[/green]\n")
+
         # PHASE 3: HANDLE DELETIONS
-        if options.get('handle_deletions'):
-            deleted_files = current_state_set - set(remote_files.keys())
-            
-            if deleted_files:
-                console.print(f"[yellow]⚠️  {len(deleted_files):,} files were deleted on remote server[/yellow]")
-                self.handle_deleted_files(local_path, deleted_files)
-                
-                # Supprimer du state
-                state_manager.delete_files(list(deleted_files))
-                console.print()
+        if options.get('handle_deletions') and deleted_files:
+            console.print(f"[yellow]⚠️  {len(deleted_files):,} files were deleted on remote server[/yellow]")
+            self.handle_deleted_files(local_path, deleted_files)
+
+            # Supprimer du state
+            state_manager.delete_files(list(deleted_files))
+            console.print()
         
         # PHASE 4: DOWNLOAD PARALLÈLE
         if not files_to_download:
@@ -209,112 +201,228 @@ class BackupOptimizedMixin:
         
         console.print(f"[bold cyan]⬇️  PHASE 4: Downloading {len(files_to_download):,} files "
                      f"({total_bytes/1024/1024:.2f} MB)[/bold cyan]\n")
-        
-        # Créer les tâches de téléchargement
-        download_tasks = []
-        for rel_path, size in files_to_download:
-            remote_file_path = os.path.join(remote_path, rel_path).replace('\\', '/')
-            local_file_path = os.path.join(local_path, rel_path)
-            
-            task = DownloadTask(
-                rel_path=rel_path,
-                remote_path=remote_file_path,
-                local_path=local_file_path,
-                size=size,
-                priority=0
-            )
-            download_tasks.append(task)
-        
-        # Organiser les téléchargements de manière intelligente
-        console.print("[dim]   Organizing downloads with hybrid strategy...[/dim]")
-        download_tasks = DownloadOrganizer.prioritize_hybrid(download_tasks)
-        
-        # Créer le downloader parallèle
-        downloader = ParallelDownloader(
-            ftp_host=self.ftp_host,
-            ftp_port=self.ftp_port,
-            ftp_user=self.ftp_user,
-            ftp_pass=self.ftp_pass,
-            num_workers=options['num_workers'],
-            max_retries=3,
-            verify_integrity=options.get('verify_integrity', True)
-        )
-        
-        # Ajouter les tâches et démarrer
-        downloader.add_tasks(download_tasks)
-        downloader.start()
-        
-        # Progress bar avec statistiques en temps réel
+
         start_time = datetime.now()
-        last_checkpoint = 0
-        checkpoint_interval = options.get('checkpoint_interval', 1000)
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("{task.completed}/{task.total} files"),
-            TextColumn("•"),
-            TextColumn("[cyan]{task.fields[speed]:.2f} MB/s[/cyan]"),
-            TextColumn("•"),
-            TimeRemainingColumn(),
-            console=console
-        ) as progress:
-            
-            download_task = progress.add_task(
-                "[cyan]Downloading...", 
-                total=len(files_to_download),
-                speed=0.0
+        success_count = 0
+        failed_count = 0
+        tar_download_done = False
+
+        # ── TAR STREAMING (bulk SFTP optimization) ──
+        TAR_STREAM_THRESHOLD = 500
+        if self.ftp_port == 22 and len(files_to_download) >= TAR_STREAM_THRESHOLD:
+            try:
+                from modules.tar_downloader import TarStreamDownloader
+
+                console.print("[dim]   Attempting tar stream (bulk SFTP optimization)...[/dim]")
+                ftp_conn = self.connect()
+                tar_dl = TarStreamDownloader(ftp_conn.ssh, remote_path, local_path,
+                                             sftp_client=ftp_conn.sftp)
+
+                if tar_dl.is_available():
+                    # Decide: full tar (no stdin) vs selective tar (pipe file list)
+                    # For full/near-full backups, download_all() is far more reliable
+                    # because it avoids piping huge file lists through stdin.
+                    use_full_tar = len(files_to_download) >= len(remote_files) * 0.8
+
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                        TextColumn("•"),
+                        TextColumn("{task.completed}/{task.total} files"),
+                        TextColumn("•"),
+                        TextColumn("[cyan]{task.fields[speed]:.2f} MB/s[/cyan]"),
+                        TextColumn("•"),
+                        TimeRemainingColumn(),
+                        console=console
+                    ) as progress:
+
+                        dl_task = progress.add_task(
+                            "[cyan]Tar streaming...",
+                            total=len(files_to_download),
+                            speed=0.0
+                        )
+
+                        def tar_progress(completed, total, stats):
+                            progress.update(dl_task, completed=completed, speed=stats.get('mbps', 0))
+
+                        if use_full_tar:
+                            console.print(f"[dim]   Full directory tar "
+                                        f"({len(files_to_download):,}/{len(remote_files):,} files)...[/dim]")
+                            tar_stats = tar_dl.download_all(
+                                tar_progress, use_compression=True,
+                                expected_total=len(files_to_download)
+                            )
+                        else:
+                            rel_paths = [rp for rp, sz in files_to_download]
+                            console.print(f"[dim]   Selective tar ({len(rel_paths):,} files)...[/dim]")
+                            tar_stats = tar_dl.download_files(
+                                rel_paths, tar_progress, use_compression=True
+                            )
+
+                    success_count = tar_stats['files_extracted']
+                    failed_files = list(tar_stats['errors'])
+
+                    # Verify integrity
+                    if options.get('verify_integrity'):
+                        console.print("[dim]   Verifying extracted files...[/dim]")
+                        expected = {rp: sz for rp, sz in files_to_download}
+                        verify_failed = tar_dl.verify_extraction(expected)
+                        if verify_failed:
+                            failed_files = verify_failed
+                            success_count = len(files_to_download) - len(verify_failed)
+                            console.print(f"[yellow]   {len(verify_failed)} files need retry via SFTP...[/yellow]")
+
+                    ftp_conn.close()
+
+                    # Retry failed files with per-file SFTP
+                    if failed_files:
+                        size_lookup = dict(files_to_download)
+                        retry_tasks = [
+                            DownloadTask(
+                                rel_path=rp,
+                                remote_path=os.path.join(remote_path, rp).replace('\\', '/'),
+                                local_path=os.path.join(local_path, rp),
+                                size=size_lookup.get(rp, 0),
+                                priority=0
+                            )
+                            for rp in failed_files
+                        ]
+
+                        console.print(f"[dim]   Retrying {len(retry_tasks)} files via per-file SFTP...[/dim]")
+                        retry_dl = ParallelDownloader(
+                            ftp_host=self.ftp_host,
+                            ftp_port=self.ftp_port,
+                            ftp_user=self.ftp_user,
+                            ftp_pass=self.ftp_pass,
+                            num_workers=min(3, options['num_workers']),
+                            max_retries=3,
+                            verify_integrity=options.get('verify_integrity', True)
+                        )
+                        retry_dl.add_tasks(retry_tasks)
+                        retry_dl.start()
+                        retry_dl.wait_completion()
+                        retry_dl.stop()
+
+                        for result in retry_dl.collect_results():
+                            if result.success:
+                                success_count += 1
+                            else:
+                                state_manager.log_error(
+                                    sync_id=sync_id,
+                                    rel_path=result.rel_path,
+                                    error_message=result.error_message or "Unknown error",
+                                    retry_count=result.retry_count
+                                )
+
+                    failed_count = len(files_to_download) - success_count
+                    tar_download_done = True
+
+                    console.print(f"\n[green]✅ Download phase completed (tar stream)[/green]")
+                    console.print(f"[dim]   Success: {success_count:,} | Failed: {failed_count:,}[/dim]\n")
+                else:
+                    ftp_conn.close()
+                    console.print("[dim]   tar not available on server, using per-file download...[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]   Tar stream error: {e}[/yellow]")
+                console.print("[dim]   Falling back to per-file download...[/dim]")
+
+        # ── PER-FILE PARALLEL DOWNLOAD (fallback / default for FTP) ──
+        if not tar_download_done:
+            download_tasks = []
+            for rel_path, size in files_to_download:
+                remote_file_path = os.path.join(remote_path, rel_path).replace('\\', '/')
+                local_file_path = os.path.join(local_path, rel_path)
+
+                task = DownloadTask(
+                    rel_path=rel_path,
+                    remote_path=remote_file_path,
+                    local_path=local_file_path,
+                    size=size,
+                    priority=0
+                )
+                download_tasks.append(task)
+
+            console.print("[dim]   Organizing downloads with hybrid strategy...[/dim]")
+            download_tasks = DownloadOrganizer.prioritize_hybrid(download_tasks)
+
+            downloader = ParallelDownloader(
+                ftp_host=self.ftp_host,
+                ftp_port=self.ftp_port,
+                ftp_user=self.ftp_user,
+                ftp_pass=self.ftp_pass,
+                num_workers=options['num_workers'],
+                max_retries=3,
+                verify_integrity=options.get('verify_integrity', True)
             )
-            
-            def progress_callback(completed, total, stats):
-                nonlocal last_checkpoint
-                
-                # Mise à jour de la progress bar
-                speed_mbps = stats.get('mbps', 0)
-                progress.update(
-                    download_task, 
-                    completed=completed,
-                    speed=speed_mbps
+
+            downloader.add_tasks(download_tasks)
+            downloader.start()
+
+            last_checkpoint = 0
+            checkpoint_interval = options.get('checkpoint_interval', 1000)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TextColumn("•"),
+                TextColumn("{task.completed}/{task.total} files"),
+                TextColumn("•"),
+                TextColumn("[cyan]{task.fields[speed]:.2f} MB/s[/cyan]"),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+
+                download_task = progress.add_task(
+                    "[cyan]Downloading...",
+                    total=len(files_to_download),
+                    speed=0.0
                 )
-                
-                # Checkpoint périodique
-                if completed - last_checkpoint >= checkpoint_interval:
-                    state_manager.create_checkpoint(
-                        sync_id=sync_id,
-                        files_processed=completed,
-                        files_total=total,
-                        bytes_transferred=stats.get('bytes_transferred', 0),
-                        status='in_progress'
+
+                def progress_callback(completed, total, stats):
+                    nonlocal last_checkpoint
+
+                    speed_mbps = stats.get('mbps', 0)
+                    progress.update(
+                        download_task,
+                        completed=completed,
+                        speed=speed_mbps
                     )
-                    last_checkpoint = completed
-            
-            # Attendre la fin
-            downloader.wait_completion(progress_callback)
-        
-        # Arrêter les workers
-        downloader.stop()
-        
-        # Collecter les résultats
-        results = downloader.collect_results()
-        
-        success_count = sum(1 for r in results if r.success)
-        failed_count = sum(1 for r in results if not r.success)
-        
-        # Log des erreurs
-        for result in results:
-            if not result.success:
-                state_manager.log_error(
-                    sync_id=sync_id,
-                    rel_path=result.rel_path,
-                    error_message=result.error_message or "Unknown error",
-                    retry_count=result.retry_count
-                )
-        
-        console.print(f"\n[green]✅ Download phase completed[/green]")
-        console.print(f"[dim]   Success: {success_count:,} | Failed: {failed_count:,}[/dim]\n")
+
+                    if completed - last_checkpoint >= checkpoint_interval:
+                        state_manager.create_checkpoint(
+                            sync_id=sync_id,
+                            files_processed=completed,
+                            files_total=total,
+                            bytes_transferred=stats.get('bytes_transferred', 0),
+                            status='in_progress'
+                        )
+                        last_checkpoint = completed
+
+                downloader.wait_completion(progress_callback)
+
+            downloader.stop()
+
+            results = downloader.collect_results()
+
+            success_count = sum(1 for r in results if r.success)
+            failed_count = sum(1 for r in results if not r.success)
+
+            for result in results:
+                if not result.success:
+                    state_manager.log_error(
+                        sync_id=sync_id,
+                        rel_path=result.rel_path,
+                        error_message=result.error_message or "Unknown error",
+                        retry_count=result.retry_count
+                    )
+
+            console.print(f"\n[green]✅ Download phase completed[/green]")
+            console.print(f"[dim]   Success: {success_count:,} | Failed: {failed_count:,}[/dim]\n")
         
         # PHASE 5: UPDATE STATE DATABASE
         console.print("[bold cyan]💾 PHASE 5: Updating state database...[/bold cyan]")
