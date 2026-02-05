@@ -27,6 +27,9 @@ class DownloadTask:
     priority: int = 0  # Plus petit = plus prioritaire
     retry_count: int = 0
 
+    def __lt__(self, other):
+        return self.priority < other.priority
+
 
 @dataclass
 class DownloadResult:
