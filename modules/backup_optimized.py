@@ -223,9 +223,13 @@ class BackupOptimizedMixin:
 
                 if tar_dl.is_available():
                     # Decide: full tar (no stdin) vs selective tar (pipe file list)
-                    # For full/near-full backups, download_all() is far more reliable
-                    # because it avoids piping huge file lists through stdin.
-                    use_full_tar = len(files_to_download) >= len(remote_files) * 0.8
+                    # Full tar is far more reliable because it avoids piping huge
+                    # file lists through stdin (which can saturate SSH buffers and
+                    # cause "Socket is closed" errors).  Prefer full tar when:
+                    #  - downloading >= 50% of remote files, OR
+                    #  - more than 2000 files to download (large stdin is fragile)
+                    use_full_tar = (len(files_to_download) >= len(remote_files) * 0.5
+                                    or len(files_to_download) > 2000)
 
                     with Progress(
                         SpinnerColumn(),
