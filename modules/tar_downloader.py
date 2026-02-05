@@ -179,7 +179,7 @@ class TarStreamDownloader:
         """
         self.stats['start_time'] = time.time()
         compress_flag = 'z' if use_compression else ''
-        cmd = f'tar c{compress_flag}hf - -C "{self.remote_root}" .'
+        cmd = f'tar c{compress_flag}hf - --ignore-failed-read --warning=no-file-changed -C "{self.remote_root}" .'
         logger.info(f"Tar stream (full): {cmd}")
 
         try:
@@ -205,7 +205,7 @@ class TarStreamDownloader:
             return self.stats
 
         compress_flag = 'z' if use_compression else ''
-        cmd = f'tar c{compress_flag}hf - -C "{self.remote_root}" -T -'
+        cmd = f'tar c{compress_flag}hf - --ignore-failed-read --warning=no-file-changed -C "{self.remote_root}" -T -'
         logger.info(f"Tar stream (selective): {len(file_list)} files")
 
         file_list_bytes = '\n'.join(file_list).encode('utf-8') + b'\n'
@@ -257,8 +257,13 @@ class TarStreamDownloader:
                         stdin.write(stdin_data[offset:offset + chunk_size])
                         offset += chunk_size
                     stdin.channel.shutdown_write()
+                except OSError:
+                    # Channel/socket already closed by the remote side — this
+                    # is expected when tar exits early (e.g. broken symlinks).
+                    pass
                 except Exception as e:
-                    logger.warning(f"stdin write error: {e}")
+                    logger.debug(f"stdin write finished early: {e}")
+                finally:
                     try:
                         stdin.channel.shutdown_write()
                     except Exception:
@@ -321,23 +326,51 @@ class TarStreamDownloader:
                 self._get_speed_stats()
             )
 
-        # Log stderr warnings and clean up SSH channel
+        # Log stderr warnings and clean up SSH channel.
+        # Filter out noise that --ignore-failed-read already handled.
+        _STDERR_NOISE = (
+            'Removing leading',
+            'stat impossible',          # FR locale: broken symlink / vanished file
+            'Cannot stat',              # EN locale: same
+            'file changed as we read',  # file modified during tar
+            'No such file or directory',
+            'Aucun fichier ou dossier',
+        )
         try:
             err = stderr.read().decode('utf-8', errors='replace').strip()
             if err:
                 for line in err.splitlines():
-                    if 'Removing leading' in line:
+                    if any(noise in line for noise in _STDERR_NOISE):
+                        logger.debug(f"tar (ignored): {line}")
                         continue
-                    logger.warning(f"tar: {line}")
+                    if line.strip():
+                        logger.warning(f"tar: {line}")
         except Exception:
             pass
 
-        # Explicitly close streams to prevent "Socket is closed" noise on GC
+        # Explicitly close streams to prevent "Socket is closed" noise on GC.
+        # Order matters: shut down stdin write direction first so the remote
+        # tar process receives EOF, then drain stderr, and finally close all
+        # three streams.  We also close the underlying channel to ensure
+        # Paramiko's BufferedFile.__del__ won't attempt a late flush on an
+        # already-dead socket.
+        try:
+            stdin.channel.shutdown_write()
+        except Exception:
+            pass
+
         for s in (stdin, stdout, stderr):
             try:
                 s.close()
             except Exception:
                 pass
+
+        # Close the channel itself so no deferred __del__ can trigger
+        # "Socket is closed" tracebacks.
+        try:
+            stdout.channel.close()
+        except Exception:
+            pass
 
     def _get_speed_stats(self) -> Dict:
         elapsed = time.time() - self.stats['start_time'] if self.stats['start_time'] else 1
