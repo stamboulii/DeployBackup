@@ -137,7 +137,7 @@ class SFTPAdapter:
                 raise Exception("Connection lost")
         return "200 Command okay"
 
-    def retrbinary(self, cmd, callback, blocksize=65536):
+    def retrbinary(self, cmd, callback, blocksize=262144):
         """
         Mimics FTP.retrbinary
         cmd format: "RETR filename"
@@ -207,28 +207,41 @@ class SFTPAdapter:
             self._log(f"CAT fallback failed: {e2}", level=logging.ERROR)
             raise Exception(f"550 Failed to open file {filename}: {e2}")
 
-    def download_file(self, remote_path, local_path):
+    def download_file(self, remote_path, local_path, blocksize=262144):
         """
-        Direct SFTP file download — bypasses retrbinary overhead.
-        Uses paramiko's native get() which is optimized for bulk transfer.
+        Direct SFTP file download with prefetch for maximum throughput.
+
+        Uses ``prefetch()`` to pipeline read requests over the SSH channel,
+        hiding network latency.  blocksize defaults to 256 KB which is
+        optimal for most networks (vs Paramiko's internal 32 KB default).
         """
         # Normalize path
         remote_path = remote_path.replace('/./', '/')
         if remote_path.startswith('./') and len(remote_path) > 2:
             remote_path = remote_path[2:]
 
+        def _download(path):
+            with self.sftp.open(path, 'rb') as rf:
+                rf.set_pipelined(True)
+                rf.prefetch()
+                with open(local_path, 'wb') as lf:
+                    while True:
+                        chunk = rf.read(blocksize)
+                        if not chunk:
+                            break
+                        lf.write(chunk)
+            return True
+
         # Try exact path first
         try:
-            self.sftp.get(remote_path, local_path)
-            return True
+            return _download(remote_path)
         except IOError:
             pass
 
         # Try without leading slash
         if remote_path.startswith('/'):
             try:
-                self.sftp.get(remote_path.lstrip('/'), local_path)
-                return True
+                return _download(remote_path.lstrip('/'))
             except IOError:
                 pass
 

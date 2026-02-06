@@ -193,32 +193,160 @@ class TarStreamDownloader:
 
     def download_files(self, file_list: List[str],
                        progress_callback: Optional[Callable] = None,
-                       use_compression: bool = True) -> Dict:
+                       use_compression: bool = True,
+                       sftp_client=None) -> Dict:
         """
         Download specific files via tar stream (for incremental updates).
 
+        Uses a tiered strategy for maximum reliability:
+          1. Write file list to a temp file on the server, then
+             ``tar -T /tmp/filelist``.  No stdin, no ARG_MAX — most robust.
+          2. If the server has no writable temp dir, fall back to passing
+             files as command-line arguments (batched for ARG_MAX).
+          3. Individual file errors are collected in ``self.stats['errors']``
+             so the caller can retry them via per-file SFTP.
+
         Args:
             file_list: List of relative paths (from remote_root)
+            sftp_client: Optional paramiko.SFTPClient for writing the temp
+                         file list (tier 1).  If None, skips to tier 2.
         """
         self.stats['start_time'] = time.time()
         if not file_list:
             return self.stats
 
         compress_flag = 'z' if use_compression else ''
-        cmd = f'tar c{compress_flag}hf - --ignore-failed-read --warning=no-file-changed -C "{self.remote_root}" -T -'
-        logger.info(f"Tar stream (selective): {len(file_list)} files")
 
-        file_list_bytes = '\n'.join(file_list).encode('utf-8') + b'\n'
+        # ── TIER 1: temp file on server (most robust) ──────────────────
+        if sftp_client and self._try_filelist_on_server(
+                sftp_client, file_list, compress_flag,
+                progress_callback):
+            self.stats['elapsed'] = time.time() - self.stats['start_time']
+            return self.stats
 
-        try:
-            self._stream_and_extract(cmd, progress_callback, len(file_list),
-                                     stdin_data=file_list_bytes)
-        except Exception as e:
-            logger.error(f"Tar stream (selective) failed: {e}")
-            self.stats['errors'].append(f"stream error: {e}")
+        # ── TIER 2: command-line arguments (batched for ARG_MAX) ───────
+        logger.info("Falling back to tar with command-line arguments")
+        self._download_via_args(file_list, compress_flag, progress_callback)
 
         self.stats['elapsed'] = time.time() - self.stats['start_time']
         return self.stats
+
+    # ── Tier 1 helper: write file list to server, tar -T <file> ────────
+
+    def _try_filelist_on_server(self, sftp_client, file_list: List[str],
+                                compress_flag: str,
+                                progress_callback: Optional[Callable]) -> bool:
+        """
+        Write the file list to a temp file on the server and run
+        ``tar -T <tmpfile>``.  Returns True if it succeeded (even
+        partially), False if the temp-file approach is not possible
+        and we should fall back to tier 2.
+        """
+        # Use null-separated paths for maximum safety (handles any filename)
+        filelist_content = '\0'.join(file_list).encode('utf-8') + b'\0'
+
+        # Find a writable directory on the server
+        remote_tmp = self._find_writable_dir(sftp_client)
+        if not remote_tmp:
+            logger.info("No writable temp dir found on server, skipping tier 1")
+            return False
+
+        import uuid
+        tmp_name = f"{remote_tmp}/.synergy_filelist_{uuid.uuid4().hex[:8]}.txt"
+
+        try:
+            # Write file list via SFTP
+            with sftp_client.open(tmp_name, 'wb') as f:
+                f.write(filelist_content)
+            logger.info(f"Wrote {len(file_list)} paths to {tmp_name}")
+
+            cmd = (f'tar c{compress_flag}hf - --ignore-failed-read '
+                   f'--warning=no-file-changed --null '
+                   f'-C "{self.remote_root}" -T "{tmp_name}"')
+            logger.info(f"Tar stream (filelist): {cmd}")
+
+            self._stream_and_extract(cmd, progress_callback, len(file_list))
+            return True
+
+        except Exception as e:
+            logger.warning(f"Tar via temp file failed: {e}")
+            # Partial success is still success — errors are in self.stats
+            if self.stats['files_extracted'] > 0:
+                return True
+            return False
+
+        finally:
+            # Clean up temp file
+            try:
+                sftp_client.remove(tmp_name)
+                logger.debug(f"Cleaned up {tmp_name}")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _find_writable_dir(sftp_client) -> Optional[str]:
+        """Find a directory we can write a temp file to on the server."""
+        candidates = ['/tmp', '/var/tmp', '.']
+        for d in candidates:
+            try:
+                # Try to create and immediately remove a test file
+                test_path = f"{d}/.synergy_write_test"
+                with sftp_client.open(test_path, 'w') as f:
+                    f.write('test')
+                sftp_client.remove(test_path)
+                return d
+            except Exception:
+                continue
+        return None
+
+    # ── Tier 2 helper: pass files as shell arguments (batched) ─────────
+
+    def _download_via_args(self, file_list: List[str],
+                           compress_flag: str,
+                           progress_callback: Optional[Callable]):
+        """
+        Pass file paths as tar command-line arguments, batched to stay
+        under the shell ARG_MAX limit (~128 KB).
+        Filenames are escaped to handle spaces, quotes, and special chars.
+        """
+        ARG_MAX_SAFE = 100_000  # bytes
+
+        batches = []
+        current_batch = []
+        current_size = 0
+
+        for path in file_list:
+            # Shell-escape: replace ' with '\'' for safe single-quoting
+            escaped = path.replace("'", "'\\''")
+            path_size = len(escaped.encode('utf-8')) + 3  # 'escaped' + space
+            if current_batch and current_size + path_size > ARG_MAX_SAFE:
+                batches.append(current_batch)
+                current_batch = []
+                current_size = 0
+            current_batch.append(escaped)
+            current_size += path_size
+
+        if current_batch:
+            batches.append(current_batch)
+
+        logger.info(f"Tar stream (args): {len(file_list)} files in {len(batches)} batch(es)")
+
+        for batch_idx, batch in enumerate(batches):
+            if self._stop:
+                break
+
+            escaped_files = ' '.join(f"'{f}'" for f in batch)
+            cmd = (f'tar c{compress_flag}hf - --ignore-failed-read '
+                   f'--warning=no-file-changed -C "{self.remote_root}" {escaped_files}')
+
+            if len(batches) > 1:
+                logger.info(f"Tar batch {batch_idx + 1}/{len(batches)}: {len(batch)} files")
+
+            try:
+                self._stream_and_extract(cmd, progress_callback, len(file_list))
+            except Exception as e:
+                logger.error(f"Tar stream (args, batch {batch_idx + 1}) failed: {e}")
+                self.stats['errors'].append(f"stream error (batch {batch_idx + 1}): {e}")
 
     def _ensure_dir(self, dir_path: str):
         """Create directory with caching"""
