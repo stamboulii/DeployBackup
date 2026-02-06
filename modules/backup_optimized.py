@@ -68,10 +68,11 @@ class BackupOptimizedMixin:
             }
 
         # Cap workers for SFTP — SSH connections are heavier than FTP
-        if self.ftp_port == 22 and options['num_workers'] > 5:
-            console.print(f"[yellow]ℹ️  SFTP detected: reducing workers from {options['num_workers']} to 5 "
+        SFTP_MAX_WORKERS = 8
+        if self.ftp_port == 22 and options['num_workers'] > SFTP_MAX_WORKERS:
+            console.print(f"[yellow]ℹ️  SFTP detected: reducing workers from {options['num_workers']} to {SFTP_MAX_WORKERS} "
                          f"(SSH connections are heavier than FTP)[/yellow]")
-            options['num_workers'] = 5
+            options['num_workers'] = SFTP_MAX_WORKERS
         
         remote_path = os.path.join(self.remote_base, remote_project_name).replace('\\', '/')
         
@@ -210,9 +211,21 @@ class BackupOptimizedMixin:
         failed_count = 0
         tar_download_done = False
 
+        # ── RSYNC (best option when available) ──
+        rsync_done = False
+        if self.ftp_port == 22 and len(files_to_download) >= 10:
+            rsync_done = self._try_rsync_download(
+                local_path, remote_path, files_to_download,
+                options, state_manager, sync_id
+            )
+            if rsync_done:
+                success_count = rsync_done['success']
+                failed_count = rsync_done['failed']
+                tar_download_done = True
+
         # ── TAR STREAMING (bulk SFTP optimization) ──
         TAR_STREAM_THRESHOLD = 500
-        if self.ftp_port == 22 and len(files_to_download) >= TAR_STREAM_THRESHOLD:
+        if not tar_download_done and self.ftp_port == 22 and len(files_to_download) >= TAR_STREAM_THRESHOLD:
             try:
                 from modules.tar_downloader import TarStreamDownloader
 
@@ -222,14 +235,11 @@ class BackupOptimizedMixin:
                                              sftp_client=ftp_conn.sftp)
 
                 if tar_dl.is_available():
-                    # Decide: full tar (no stdin) vs selective tar (pipe file list)
-                    # Full tar is far more reliable because it avoids piping huge
-                    # file lists through stdin (which can saturate SSH buffers and
-                    # cause "Socket is closed" errors).  Prefer full tar when:
-                    #  - downloading >= 50% of remote files, OR
-                    #  - more than 2000 files to download (large stdin is fragile)
-                    use_full_tar = (len(files_to_download) >= len(remote_files) * 0.5
-                                    or len(files_to_download) > 2000)
+                    # Decide: full tar vs selective tar (file args, no stdin)
+                    # Full tar downloads the entire directory — best when we need
+                    # most of the files anyway.  Selective tar passes files as
+                    # command-line arguments (batched to stay under ARG_MAX).
+                    use_full_tar = len(files_to_download) >= len(remote_files) * 0.5
 
                     with Progress(
                         SpinnerColumn(),
@@ -265,7 +275,8 @@ class BackupOptimizedMixin:
                             rel_paths = [rp for rp, sz in files_to_download]
                             console.print(f"[dim]   Selective tar ({len(rel_paths):,} files)...[/dim]")
                             tar_stats = tar_dl.download_files(
-                                rel_paths, tar_progress, use_compression=True
+                                rel_paths, tar_progress, use_compression=True,
+                                sftp_client=ftp_conn.sftp
                             )
 
                     success_count = tar_stats['files_extracted']
@@ -455,7 +466,96 @@ class BackupOptimizedMixin:
             total_bytes, start_time
         )
     
-    def _show_backup_summary(self, state_manager: StateManager, sync_id: str, 
+    def _try_rsync_download(self, local_path, remote_path, files_to_download,
+                             options, state_manager, sync_id):
+        """
+        Try using rsync over SSH for downloading files.
+        Returns {'success': N, 'failed': N} if rsync worked, False otherwise.
+        """
+        import subprocess
+        import shutil
+
+        # Check if rsync is available locally
+        if not shutil.which('rsync'):
+            return False
+
+        # Check if rsync is available on the remote server
+        try:
+            ftp_conn = self.connect()
+            stdin, stdout, stderr = ftp_conn.ssh.exec_command('command -v rsync', timeout=10)
+            out = stdout.read().decode('utf-8', errors='replace').strip()
+            exit_code = stdout.channel.recv_exit_status()
+            ftp_conn.close()
+
+            if exit_code != 0 or not out:
+                return False
+        except Exception:
+            return False
+
+        console.print("[dim]   rsync detected on server — using rsync for optimal transfer...[/dim]")
+
+        # Write file list for --files-from
+        import tempfile
+        filelist_path = tempfile.mktemp(suffix='.txt', prefix='synergy_rsync_')
+        try:
+            with open(filelist_path, 'w', encoding='utf-8') as f:
+                for rel_path, size in files_to_download:
+                    f.write(rel_path + '\n')
+
+            # Build rsync command
+            remote_spec = f"{self.ftp_user}@{self.ftp_host}:{remote_path}/"
+            cmd = [
+                'rsync', '-avz', '--partial', '--timeout=300',
+                f'--files-from={filelist_path}',
+                '-e', f'ssh -p {self.ftp_port} -o StrictHostKeyChecking=no',
+                remote_spec,
+                local_path + '/'
+            ]
+
+            console.print(f"[dim]   rsync: {len(files_to_download):,} files...[/dim]")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+            if result.returncode in (0, 23, 24):
+                # 0 = success, 23 = partial transfer (some files vanished), 24 = vanished source files
+                # Count successes by checking which files now exist locally
+                success = 0
+                failed = 0
+                for rel_path, size in files_to_download:
+                    local_file = os.path.join(local_path, rel_path)
+                    if os.path.exists(local_file):
+                        success += 1
+                    else:
+                        failed += 1
+                        state_manager.log_error(
+                            sync_id=sync_id,
+                            rel_path=rel_path,
+                            error_message="rsync: file not transferred",
+                            retry_count=0
+                        )
+
+                console.print(f"\n[green]✅ Download phase completed (rsync)[/green]")
+                console.print(f"[dim]   Success: {success:,} | Failed: {failed:,}[/dim]\n")
+                return {'success': success, 'failed': failed}
+            else:
+                console.print(f"[yellow]   rsync failed (exit {result.returncode}), falling back...[/yellow]")
+                if result.stderr:
+                    for line in result.stderr.splitlines()[:3]:
+                        console.print(f"[dim]   {line}[/dim]")
+                return False
+
+        except subprocess.TimeoutExpired:
+            console.print("[yellow]   rsync timed out, falling back...[/yellow]")
+            return False
+        except Exception as e:
+            console.print(f"[yellow]   rsync error: {e}, falling back...[/yellow]")
+            return False
+        finally:
+            try:
+                os.remove(filelist_path)
+            except OSError:
+                pass
+
+    def _show_backup_summary(self, state_manager: StateManager, sync_id: str,
                             success_count: int, failed_count: int, 
                             bytes_transferred: int, start_time: datetime):
         """Affiche le résumé final du backup"""
