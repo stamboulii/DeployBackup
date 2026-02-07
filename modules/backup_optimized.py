@@ -517,15 +517,22 @@ class BackupOptimizedMixin:
 
             if result.returncode in (0, 23, 24):
                 # 0 = success, 23 = partial transfer (some files vanished), 24 = vanished source files
-                # Count successes by checking which files now exist locally
+                # Count successes by checking which files now exist locally.
+                # Files that vanished on the server (code 23/24) are expected
+                # for ephemeral content (PHP sessions, temp files) — we count
+                # them as "skipped", not "failed".
                 success = 0
-                failed = 0
+                vanished = 0
+                real_failed = 0
                 for rel_path, size in files_to_download:
                     local_file = os.path.join(local_path, rel_path)
                     if os.path.exists(local_file):
                         success += 1
+                    elif result.returncode in (23, 24):
+                        # File likely vanished on server between scan and download
+                        vanished += 1
                     else:
-                        failed += 1
+                        real_failed += 1
                         state_manager.log_error(
                             sync_id=sync_id,
                             rel_path=rel_path,
@@ -534,8 +541,13 @@ class BackupOptimizedMixin:
                         )
 
                 console.print(f"\n[green]✅ Download phase completed (rsync)[/green]")
-                console.print(f"[dim]   Success: {success:,} | Failed: {failed:,}[/dim]\n")
-                return {'success': success, 'failed': failed}
+                console.print(f"[dim]   Success: {success:,} | "
+                             f"Vanished on server: {vanished:,} | "
+                             f"Failed: {real_failed:,}[/dim]\n")
+                if vanished > 0:
+                    console.print(f"[dim]   ℹ️  {vanished:,} files disappeared on the server between "
+                                 f"scan and download (sessions, temp files — this is normal)[/dim]\n")
+                return {'success': success, 'failed': real_failed}
             else:
                 console.print(f"[yellow]   rsync failed (exit {result.returncode}), falling back...[/yellow]")
                 if result.stderr:

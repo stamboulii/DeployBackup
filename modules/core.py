@@ -33,10 +33,11 @@ class SynergyCore:
     DEPLOY_STATE_FILE = '.deploy_enabled'
     PROTECTED_PATHS = ['/', '/ftp', '/production', '/prod', '/live', '/www', '/public_html']
     EXCLUDE_PATTERNS = [
-        '*.log', '*.tmp', '.git/', '.svn/', 
+        '*.log', '*.tmp', '.git/', '.svn/',
         'node_modules/', '__pycache__/', '*.pyc',
         'cache/', 'tmp/', 'temp/', '.DS_Store',
-        'Thumbs.db', '.idea/', '.vscode/'
+        'Thumbs.db', '.idea/', '.vscode/',
+        '.sessions/', 'sessions/', 'sess_',
     ]
     
     def __init__(self):
