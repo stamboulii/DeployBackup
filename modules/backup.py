@@ -8,71 +8,28 @@ from modules.core import console
 
 class BackupMixin:
     def handle_deleted_files(self, local_path, deleted_files):
-        """Gère les fichiers supprimés sur le serveur"""
+        """
+        Supprime automatiquement les fichiers locaux qui ont été
+        supprimés sur le serveur distant (mirror sync).
+        """
         if not deleted_files:
             return
-        
-        console.print(f"\n[yellow]⚠️  {len(deleted_files)} file(s) were deleted on the remote server.[/yellow]")
-        
-        # Afficher la liste
-        delete_table = Table(title="Files Deleted on Remote Server", show_header=True)
-        delete_table.add_column("File", style="red")
-        delete_table.add_column("Local Path", style="yellow")
-        
-        for rel_path in list(deleted_files)[:10]:  # Afficher 10 premiers
+
+        deleted_count = 0
+        failed_count = 0
+        for rel_path in deleted_files:
             local_file = os.path.join(local_path, rel_path)
-            delete_table.add_row(rel_path, local_file)
-        
-        if len(deleted_files) > 10:
-            delete_table.add_row(f"... and {len(deleted_files)-10} more", "")
-        
-        console.print(delete_table)
-        
-        # Demander confirmation
-        console.print("\n[bold yellow]What do you want to do?[/bold yellow]")
-        console.print("1. [red]Delete them locally[/red] (mirror remote - recommended)")
-        console.print("2. [green]Keep them locally[/green] (local backup remains)")
-        console.print("3. [cyan]Move to archive folder[/cyan] (.archive/TIMESTAMP/)")
-        
-        choice = console.input("\n[bold]Your choice (1/2/3):[/bold] ")
-        
-        if choice == '1':
-            # Supprimer localement
-            deleted_count = 0
-            for rel_path in deleted_files:
-                local_file = os.path.join(local_path, rel_path)
-                if os.path.exists(local_file):
-                    try:
-                        os.remove(local_file)
-                        deleted_count += 1
-                        console.print(f"[red]Deleted:[/red] {rel_path}")
-                    except Exception as e:
-                        console.print(f"[red]Failed to delete {rel_path}: {e}[/red]")
-            console.print(f"\n[green]✅ Deleted {deleted_count} files locally.[/green]")
-        
-        elif choice == '3':
-            # Archiver
-            archive_dir = os.path.join(local_path, '.archive', datetime.now().strftime('%Y%m%d_%H%M%S'))
-            os.makedirs(archive_dir, exist_ok=True)
-            
-            archived_count = 0
-            for rel_path in deleted_files:
-                local_file = os.path.join(local_path, rel_path)
-                if os.path.exists(local_file):
-                    try:
-                        archive_file = os.path.join(archive_dir, rel_path)
-                        os.makedirs(os.path.dirname(archive_file), exist_ok=True)
-                        import shutil
-                        shutil.move(local_file, archive_file)
-                        archived_count += 1
-                        console.print(f"[cyan]Archived:[/cyan] {rel_path}")
-                    except Exception as e:
-                        console.print(f"[red]Failed to archive {rel_path}: {e}[/red]")
-            console.print(f"\n[green]✅ Archived {archived_count} files to {archive_dir}[/green]")
-        
-        else:
-            # Garder localement
-            console.print("\n[green]✅ Files kept locally.[/green]")
+            if os.path.exists(local_file):
+                try:
+                    os.remove(local_file)
+                    deleted_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    console.print(f"[red]Failed to delete {rel_path}: {e}[/red]")
+
+        console.print(f"[green]✅ Deleted {deleted_count:,} files locally.[/green]")
+        if failed_count > 0:
+            console.print(f"[yellow]   {failed_count:,} files could not be deleted.[/yellow]")
     
     def backup(self, local_path, remote_project_name, options=None):
         """
