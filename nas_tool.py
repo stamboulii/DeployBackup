@@ -131,14 +131,15 @@ def interactive_menu():
             # Déterminer le nombre de workers selon la connexion
             is_sftp = tool.ftp_port == 22
             if is_sftp:
-                console.print("\n[dim]SFTP detected — workers are capped at 5 (SSH connections are heavier)[/dim]")
+                console.print("\n[dim]SFTP detected — workers are capped at 8 (SSH connections are heavier)[/dim]")
                 console.print("[dim]Connection speed:[/dim]")
                 console.print("  1. Slow connection → 2 workers")
-                console.print("  2. Normal connection → 3 workers [recommended]")
-                console.print("  3. Fast connection → 5 workers")
-                speed_choice = console.input("[bold]Your choice (1-3) [2]:[/bold] ") or "2"
-                workers_map = {"1": 2, "2": 3, "3": 5}
-                workers = workers_map.get(speed_choice, 3)
+                console.print("  2. Normal connection → 4 workers [recommended]")
+                console.print("  3. Fast connection → 6 workers")
+                console.print("  4. Max → 8 workers")
+                speed_choice = console.input("[bold]Your choice (1-4) [2]:[/bold] ") or "2"
+                workers_map = {"1": 2, "2": 4, "3": 6, "4": 8}
+                workers = workers_map.get(speed_choice, 4)
             else:
                 console.print("\n[dim]Connection speed:[/dim]")
                 console.print("  1. ADSL (< 10 Mbps) → 3-5 workers")
@@ -295,7 +296,7 @@ Examples:
             if args.workers is not None:
                 workers = args.workers
             elif is_sftp:
-                workers = {1: 2, 2: 3, 3: 5, 4: 5}.get(args.speed, 3)
+                workers = {1: 2, 2: 4, 3: 6, 4: 8}.get(args.speed, 4)
             else:
                 workers = {1: 5, 2: 10, 3: 20, 4: 30}.get(args.speed, 10)
 
