@@ -376,7 +376,14 @@ class SFTPAdapter:
                     if attr.filename in ('.', '..'):
                         continue
 
+                    # Détecter les symlinks
+                    is_symlink = stat.S_ISLNK(attr.st_mode)
                     is_dir = stat.S_ISDIR(attr.st_mode)
+                    
+                    if is_symlink:
+                        self._log(f"Skipping symlink: {attr.filename}", level=logging.DEBUG)
+                        continue
+                        
                     entry_type = 'dir' if is_dir else 'file'
                     size = attr.st_size
                     # MLSD format for time: YYYYMMDDHHMMSS
@@ -398,8 +405,16 @@ class SFTPAdapter:
                     if attr.filename in ('.', '..'):
                         continue
                         
-                    is_dir = 'd' if stat.S_ISDIR(attr.st_mode) else '-'
-                    perm_str = is_dir + 'rwxrwxrwx' # Fake perms
+                    # Détecter les symlinks
+                    is_symlink = stat.S_ISLNK(attr.st_mode)
+                    is_dir = stat.S_ISDIR(attr.st_mode)
+                    
+                    if is_symlink:
+                        self._log(f"Skipping symlink: {attr.filename}", level=logging.DEBUG)
+                        continue
+                    
+                    type_char = 'd' if is_dir else '-'
+                    perm_str = type_char + 'rwxrwxrwx' # Fake perms
                     size = str(attr.st_size)
                     name = attr.filename
                     

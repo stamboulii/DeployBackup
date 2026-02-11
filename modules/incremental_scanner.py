@@ -169,6 +169,7 @@ class IncrementalScanner:
     def _scan_directory_mlsd(self, dir_path: str) -> Tuple[List[Tuple], bool]:
         """
         Scan un dossier avec MLSD (plus moderne et fiable)
+        Détecte et skip les symlinks pour éviter les problèmes de taille
         Returns: (items, supports_mlsd)
         """
         try:
@@ -188,6 +189,18 @@ class IncrementalScanner:
                     if '=' in part:
                         key, value = part.split('=', 1)
                         props[key] = value
+                
+                # Détecter les symlinks (type=lnk) et les skipper
+                item_type = props.get('type', '')
+                if item_type == 'lnk':
+                    logger.debug(f"Skipping symlink: {name}")
+                    continue
+                    
+                # Détecter les liens via 'unique' ou d'autres indicateurs
+                if props.get('unique') and props.get('type') != 'dir' and props.get('type') != 'file':
+                    # Peut être un lien symbolique
+                    logger.debug(f"Skipping potential link: {name} (type={item_type})")
+                    continue
 
                 parsed_items.append((name, props))
 
@@ -199,6 +212,7 @@ class IncrementalScanner:
     def _scan_directory_list(self, dir_path: str) -> List[Tuple]:
         """
         Scan un dossier avec LIST (fallback)
+        Détecte et skip les symlinks pour éviter les problèmes de taille
         Returns: [(name, props)]
         """
         try:
@@ -217,6 +231,11 @@ class IncrementalScanner:
                 name = parts[8]
 
                 if name in ('.', '..'):
+                    continue
+                
+                # Détecter les symlinks (permissions commencent par 'l')
+                if permissions.startswith('l'):
+                    logger.debug(f"Skipping symlink: {name}")
                     continue
 
                 props = {

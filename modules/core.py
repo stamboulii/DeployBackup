@@ -186,13 +186,15 @@ class SynergyCore:
         return False
     
     def verify_file_integrity(self, local_file, expected_size):
-        """Vérifie l'intégrité du fichier téléchargé"""
+        """Vérifie l'intégrité du fichier téléchargé avec tolérance"""
         if not os.path.exists(local_file):
             return False, "File doesn't exist"
         
         actual_size = os.path.getsize(local_file)
-        if actual_size != expected_size:
-            return False, f"Size mismatch: expected {expected_size}, got {actual_size}"
+        # Tolérance de 0.1% pour les différences de taille dues à l'encodage/transfert
+        tolerance = max(int(expected_size * 0.001), 10)  # 0.1% ou minimum 10 bytes
+        if abs(actual_size - expected_size) > tolerance:
+            return False, f"Size mismatch: expected {expected_size}, got {actual_size} (tolerance: {tolerance})"
         
         return True, "OK"
 

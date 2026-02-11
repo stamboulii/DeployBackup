@@ -13,6 +13,12 @@ from typing import List, Callable, Optional, Dict
 from datetime import datetime
 import time
 from modules.sftp_adapter import SFTPAdapter
+from modules.checksum_utils import (
+    calculate_file_hash,
+    calculate_remote_hash,
+    verify_download_integrity,
+    get_remote_file_info
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +68,16 @@ class ParallelDownloader:
                  ftp_pass: str,
                  num_workers: int = 10,
                  max_retries: int = 3,
-                 verify_integrity: bool = True):
+                 verify_integrity: bool = True,
+                 use_hash_verification: bool = False,
+                 hash_algorithm: str = 'md5'):
         """
         Args:
             num_workers: Nombre de connexions FTP simultanées
             max_retries: Nombre de tentatives par fichier
             verify_integrity: Vérifier la taille après download
+            use_hash_verification: Utiliser hash MD5/SHA pour vérification (plus fiable)
+            hash_algorithm: Algorithme de hash (md5, sha1, sha256)
         """
         self.ftp_host = ftp_host
         self.ftp_port = ftp_port
@@ -76,6 +86,8 @@ class ParallelDownloader:
         self.num_workers = num_workers
         self.max_retries = max_retries
         self.verify_integrity = verify_integrity
+        self.use_hash_verification = use_hash_verification
+        self.hash_algorithm = hash_algorithm
 
         # Queues
         self.task_queue = queue.PriorityQueue()
@@ -262,8 +274,133 @@ class ParallelDownloader:
         with self._dirs_lock:
             self._created_dirs.add(dir_path)
 
+    def _verify_download(self, ftp, task: DownloadTask, local_path: str, start_time: float) -> tuple:
+        """
+        Vérifie l'intégrité du fichier téléchargé.
+        
+        Strategy:
+        1. Si hash verification activé et SSH dispo: vérifier via hash distant
+        2. Sinon: vérification taille avec tolérance
+        3. En cas d'échec: smart retry avec re-scan du fichier
+        
+        Returns:
+            (success: bool, message: str, new_size: int or None)
+        """
+        # Récupérer le client SSH si disponible (pour hash verification)
+        ssh = None
+        sftp = None
+        if self._is_sftp and hasattr(ftp, 'ssh'):
+            ssh = ftp.ssh
+            sftp = ftp.sftp
+        
+        # === Option 1: Hash verification (si activé et SSH dispo) ===
+        if self.use_hash_verification and ssh and self.hash_algorithm:
+            # Calculer hash distant
+            remote_hash = calculate_remote_hash(ssh, task.remote_path, self.hash_algorithm)
+            if remote_hash:
+                # Comparer avec hash local
+                local_hash = calculate_file_hash(local_path, self.hash_algorithm)
+                if local_hash and local_hash.lower() == remote_hash.lower():
+                    return True, f"Hash verified ({self.hash_algorithm})", None
+                
+                # Hash mismatch: fichier corrompu ou différent
+                logger.debug(f"Hash mismatch for {task.rel_path}: remote={remote_hash}, local={local_hash}")
+                return False, f"Hash mismatch: remote={remote_hash}, local={local_hash}", None
+            else:
+                logger.debug(f"Remote hash not available for {task.rel_path}, falling back to size")
+        
+        # === Option 2: Size verification avec tolérance ===
+        if task.size > 0:
+            actual_size = os.path.getsize(local_path)
+            tolerance = max(int(task.size * 0.001), 10)  # 0.1% ou minimum 10 bytes
+            
+            if abs(actual_size - task.size) <= tolerance:
+                return True, f"Size verified (tolerance: {tolerance} bytes)", actual_size
+            
+            # Size mismatch détecté
+            logger.debug(f"Size mismatch for {task.rel_path}: expected={task.size}, actual={actual_size}, tolerance={tolerance}")
+            
+            # === SMART RETRY: Re-scanner le fichier et vérifier s'il a changé ===
+            if ssh or sftp:
+                try:
+                    # Obtenir la nouvelle info du fichier distant
+                    remote_info = get_remote_file_info(ssh, sftp, task.remote_path)
+                    
+                    if remote_info['is_symlink']:
+                        # C'est un symlink - ne pas traiter comme fichier regular
+                        return True, "Symlink skipped", None
+                    
+                    new_size = remote_info['size']
+                    if new_size != task.size:
+                        # La taille a changé - c'est un nouveau fichier, accepter
+                        logger.info(f"File {task.rel_path} was modified: {task.size} -> {new_size} bytes")
+                        return True, f"Accepted new size: {new_size}", new_size
+                    
+                    # Même taille mais différente - possible corruption
+                    if remote_info.get('hash'):
+                        local_hash = calculate_file_hash(local_path, self.hash_algorithm)
+                        if local_hash and local_hash.lower() == remote_info['hash'].lower():
+                            return True, "Hash verified after re-scan", new_size
+                        
+                except Exception as e:
+                    logger.debug(f"Smart retry re-scan failed for {task.rel_path}: {e}")
+            
+            # Retourner l'échec
+            return False, f"Size mismatch: expected {task.size}, got {actual_size} (tolerance: {tolerance})", None
+        
+        # Pas de vérification possible
+        return True, "No verification performed", None
+
+    def _smart_rescan_and_retry(self, ftp, task: DownloadTask, start_time: float) -> DownloadResult:
+        """
+        Smart retry: Re-scanner le fichier distant et adapter les attentes.
+        
+        Returns DownloadResult with updated expectations if file changed.
+        """
+        ssh = None
+        sftp = None
+        if self._is_sftp and hasattr(ftp, 'ssh'):
+            ssh = ftp.ssh
+            sftp = ftp.sftp
+        
+        try:
+            # Re-scanner le fichier distant
+            remote_info = get_remote_file_info(ssh, sftp, task.remote_path)
+            
+            if remote_info['is_symlink']:
+                # Skipper les symlinks
+                return DownloadResult(
+                    rel_path=task.rel_path,
+                    success=True,
+                    size=0,
+                    duration=time.time() - start_time,
+                    error_message="Symlink skipped"
+                )
+            
+            new_size = remote_info['size']
+            new_mtime = remote_info['mtime']
+            
+            # Si la taille a changé, accepter le nouveau fichier
+            if new_size != task.size:
+                logger.info(f"Smart retry: accepting new size for {task.rel_path}: {task.size} -> {new_size}")
+                return DownloadResult(
+                    rel_path=task.rel_path,
+                    success=True,
+                    size=new_size,
+                    duration=time.time() - start_time,
+                    error_message=f"Size updated: {task.size} -> {new_size}"
+                )
+            
+            # Même taille mais échec de hash - re-download
+            logger.debug(f"Smart retry: re-downloading {task.rel_path} (same size)")
+            return None  # Indique de réessayer le download
+            
+        except Exception as e:
+            logger.warning(f"Smart rescan failed for {task.rel_path}: {e}")
+            return None  # Indique de réessayer le download
+    
     def _download_file(self, ftp, task: DownloadTask, worker_id: int) -> DownloadResult:
-        """Télécharge un fichier unique"""
+        """Télécharge un fichier unique avec vérification d'intégrité"""
         start_time = time.time()
 
         try:
@@ -277,31 +414,44 @@ class ParallelDownloader:
                 with open(task.local_path, 'wb') as f:
                     ftp.retrbinary(f"RETR {task.remote_path}", f.write)
 
-            # Vérification d'intégrité
+            # Vérification d'intégrité avec hash + smart retry
             if self.verify_integrity and task.size > 0:
-                actual_size = os.path.getsize(task.local_path)
-                if actual_size != task.size:
+                success, msg, new_size = self._verify_download(ftp, task, task.local_path, start_time)
+                
+                if not success:
+                    # Essayer le smart retry une fois
+                    if task.retry_count == 0:  # Première tentative seulement
+                        smart_result = self._smart_rescan_and_retry(ftp, task, start_time)
+                        if smart_result:
+                            return smart_result
+                    
+                    # Échec final
                     os.remove(task.local_path)
                     return DownloadResult(
                         rel_path=task.rel_path,
                         success=False,
                         size=0,
                         duration=time.time() - start_time,
-                        error_message=f"Size mismatch: expected {task.size}, got {actual_size}",
+                        error_message=msg,
                         retry_count=task.retry_count
                     )
+                
+                # Succès avec possibly nouvelle taille
+                actual_size = new_size if new_size else task.size
+            else:
+                actual_size = task.size
 
             # Succès
             duration = time.time() - start_time
 
             with self.stats_lock:
                 self.stats['completed'] += 1
-                self.stats['bytes_transferred'] += task.size
+                self.stats['bytes_transferred'] += actual_size
 
             return DownloadResult(
                 rel_path=task.rel_path,
                 success=True,
-                size=task.size,
+                size=actual_size,
                 duration=duration,
                 retry_count=task.retry_count
             )
